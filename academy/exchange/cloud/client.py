@@ -9,12 +9,15 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from collections.abc import Awaitable
+from collections.abc import Callable
 from collections.abc import Generator
 from typing import Any
 from typing import Generic
 from typing import Literal
 from typing import NamedTuple
 from typing import TYPE_CHECKING
+from typing import TypeVar
 from urllib.parse import urlparse
 
 if sys.version_info >= (3, 11):  # pragma: >=3.11 cover
@@ -56,6 +59,30 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EXCHANGE_URL = 'https://exchange.academy-agents.org'
 
+_T = TypeVar('_T')
+
+# 502/503/504 mean the exchange (or an upstream proxy) is briefly
+# unreachable; 500 may be a deterministic server bug, so we don't retry it.
+_RETRYABLE_HTTP_STATUSES: frozenset[int] = frozenset({502, 503, 504})
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    # Connection-level failures (TCP reset, DNS, server disconnect mid-request)
+    # and aiohttp's own timeout signal are all transient.
+    if isinstance(
+        exc,
+        (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            asyncio.TimeoutError,
+        ),
+    ):
+        return True
+    return (
+        isinstance(exc, aiohttp.ClientResponseError)
+        and exc.status in _RETRYABLE_HTTP_STATUSES
+    )
+
 
 class _HttpConnectionInfo(NamedTuple):
     url: str
@@ -63,6 +90,8 @@ class _HttpConnectionInfo(NamedTuple):
     ssl_verify: bool | None = None
     request_timeout_s: float = 60
     client_timeout: aiohttp.ClientTimeout | None = None
+    max_retries: int = 3
+    retry_backoff_base_s: float = 1.0
 
 
 class HttpAgentRegistration(BaseModel, Generic[AgentT]):
@@ -159,6 +188,36 @@ class HttpExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
     def mailbox_id(self) -> EntityId:
         return self._mailbox_id
 
+    async def _request_with_retry(
+        self,
+        operation: Callable[[], Awaitable[_T]],
+        description: str,
+    ) -> _T:
+        # Wraps a single HTTP operation against the exchange and retries it
+        # on transient transport-level failures. Definitive errors (auth,
+        # bad entity, mailbox terminated, message too large) are raised
+        # by ``_raise_for_status`` *inside* the operation and propagate
+        # immediately because ``_is_retryable_error`` rejects them.
+        max_retries = self._info.max_retries
+        for attempt in range(max_retries + 1):
+            try:
+                return await operation()
+            except Exception as exc:
+                if attempt >= max_retries or not _is_retryable_error(exc):
+                    raise
+                delay = self._info.retry_backoff_base_s * (2**attempt)
+                logger.warning(
+                    'Retrying %s after transient error (attempt %d/%d, '
+                    'sleeping %.2fs): %s',
+                    description,
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError('Unreachable.')
+
     async def close(self) -> None:
         await self._session.close()
 
@@ -174,17 +233,22 @@ class HttpExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         else:
             agent_str = f'{agent.__module__}.{agent.__name__}'
 
-        async with self._session.get(
-            self._discover_url,
-            json={
-                'agent': agent_str,
-                'allow_subclasses': allow_subclasses,
-            },
-        ) as response:
-            _raise_for_status(response, self.mailbox_id)
-            agent_ids_str = (await response.json())['agent_ids']
-        agent_ids = [aid for aid in agent_ids_str.split(',') if len(aid) > 0]
-        return tuple(AgentId(uid=uuid.UUID(aid)) for aid in agent_ids)
+        async def _do() -> tuple[AgentId[Any], ...]:
+            async with self._session.get(
+                self._discover_url,
+                json={
+                    'agent': agent_str,
+                    'allow_subclasses': allow_subclasses,
+                },
+            ) as response:
+                _raise_for_status(response, self.mailbox_id)
+                agent_ids_str = (await response.json())['agent_ids']
+            agent_ids = [
+                aid for aid in agent_ids_str.split(',') if len(aid) > 0
+            ]
+            return tuple(AgentId(uid=uuid.UUID(aid)) for aid in agent_ids)
+
+        return await self._request_with_retry(_do, 'discover')
 
     def factory(self) -> HttpExchangeFactory:
         # Note: When getting factory, auth method is not preserved
@@ -288,49 +352,65 @@ class HttpExchangeTransport(ExchangeTransportMixin, NoPickleMixin):
         name: str | None = None,
     ) -> HttpAgentRegistration[AgentT]:
         aid: AgentId[AgentT] = AgentId.new(name=name)
-        async with self._session.post(
-            self._mailbox_url,
-            json={
-                'mailbox': aid.model_dump_json(),
-                'agent': ','.join(agent._agent_mro()),
-            },
-        ) as response:
-            _raise_for_status(response, self.mailbox_id, aid)
-        return HttpAgentRegistration(agent_id=aid)
+
+        async def _do() -> HttpAgentRegistration[AgentT]:
+            async with self._session.post(
+                self._mailbox_url,
+                json={
+                    'mailbox': aid.model_dump_json(),
+                    'agent': ','.join(agent._agent_mro()),
+                },
+            ) as response:
+                _raise_for_status(response, self.mailbox_id, aid)
+            return HttpAgentRegistration(agent_id=aid)
+
+        return await self._request_with_retry(_do, 'register_agent')
 
     async def send(self, message: Message[Any]) -> None:
-        async with self._session.put(
-            self._message_url,
-            json={'message': message.model_dump_json()},
-        ) as response:
-            _raise_for_status(response, self.mailbox_id, message.dest)
+        async def _do() -> None:
+            async with self._session.put(
+                self._message_url,
+                json={'message': message.model_dump_json()},
+            ) as response:
+                _raise_for_status(response, self.mailbox_id, message.dest)
+
+        await self._request_with_retry(_do, 'send')
 
     async def status(self, uid: EntityId) -> MailboxStatus:
-        async with self._session.get(
-            self._mailbox_url,
-            json={'mailbox': uid.model_dump_json()},
-        ) as response:
-            _raise_for_status(response, self.mailbox_id, uid)
-            status = (await response.json())['status']
-            return MailboxStatus(status)
+        async def _do() -> MailboxStatus:
+            async with self._session.get(
+                self._mailbox_url,
+                json={'mailbox': uid.model_dump_json()},
+            ) as response:
+                _raise_for_status(response, self.mailbox_id, uid)
+                status = (await response.json())['status']
+                return MailboxStatus(status)
+
+        return await self._request_with_retry(_do, 'status')
 
     async def terminate(self, uid: EntityId) -> None:
-        async with self._session.delete(
-            self._mailbox_url,
-            json={'mailbox': uid.model_dump_json()},
-        ) as response:
-            _raise_for_status(response, self.mailbox_id, uid)
+        async def _do() -> None:
+            async with self._session.delete(
+                self._mailbox_url,
+                json={'mailbox': uid.model_dump_json()},
+            ) as response:
+                _raise_for_status(response, self.mailbox_id, uid)
+
+        await self._request_with_retry(_do, 'terminate')
 
     async def update_heartbeat(self) -> None:
         pass  # Server tracks this automatically via listen/send
 
     async def heartbeat_status(self, uid: EntityId) -> float | None:
-        async with self._session.get(
-            self._heartbeat_url,
-            json={'mailbox': uid.model_dump_json()},
-        ) as response:
-            _raise_for_status(response, self.mailbox_id, uid)
-            return (await response.json())['heartbeat']
+        async def _do() -> float | None:
+            async with self._session.get(
+                self._heartbeat_url,
+                json={'mailbox': uid.model_dump_json()},
+            ) as response:
+                _raise_for_status(response, self.mailbox_id, uid)
+                return (await response.json())['heartbeat']
+
+        return await self._request_with_retry(_do, 'heartbeat_status')
 
 
 class HttpExchangeConsole:
@@ -392,6 +472,8 @@ class HttpExchangeConsole:
             ssl_verify=self._info.ssl_verify,
             request_timeout_s=self._info.request_timeout_s,
             client_timeout=self._info.client_timeout,
+            max_retries=self._info.max_retries,
+            retry_backoff_base_s=self._info.retry_backoff_base_s,
         )
 
     async def share_mailbox(
@@ -477,6 +559,15 @@ class HttpExchangeFactory(ExchangeFactory[HttpExchangeTransport]):
             long-lived SSE listen connections are not severed mid-stream.
             Pass a custom [`aiohttp.ClientTimeout`][aiohttp.ClientTimeout] to
             override.
+        max_retries: Number of times to retry a transport request after a
+            transient transport-level failure (connection drop, server
+            disconnect, request timeout, or HTTP 502/503/504). Definitive
+            errors such as authentication failures, missing/terminated
+            mailboxes, and oversize messages are never retried. Set to ``0``
+            to disable retries.
+        retry_backoff_base_s: Base delay in seconds for exponential backoff
+            between retries. Attempt ``n`` waits
+            ``retry_backoff_base_s * 2**n`` seconds before retrying.
     """
 
     def __init__(  # noqa: PLR0913
@@ -487,6 +578,8 @@ class HttpExchangeFactory(ExchangeFactory[HttpExchangeTransport]):
         request_timeout_s: float = 60,
         ssl_verify: bool | None = None,
         client_timeout: aiohttp.ClientTimeout | None = None,
+        max_retries: int = 3,
+        retry_backoff_base_s: float = 1.0,
     ) -> None:
         if additional_headers is None:
             additional_headers = {}
@@ -506,12 +599,19 @@ class HttpExchangeFactory(ExchangeFactory[HttpExchangeTransport]):
             # timeout so unreachable hosts still fail fast.
             client_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30)
 
+        if max_retries < 0:
+            raise ValueError('max_retries must be non-negative.')
+        if retry_backoff_base_s < 0:
+            raise ValueError('retry_backoff_base_s must be non-negative.')
+
         self._info = _HttpConnectionInfo(
             url=url,
             additional_headers=additional_headers,
             ssl_verify=ssl_verify,
             request_timeout_s=request_timeout_s,
             client_timeout=client_timeout,
+            max_retries=max_retries,
+            retry_backoff_base_s=retry_backoff_base_s,
         )
 
     async def _create_transport(
