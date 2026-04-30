@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import pickle
 import uuid
@@ -9,6 +10,7 @@ from unittest import mock
 import aiohttp
 import pytest
 
+from academy.agent import Agent
 from academy.exception import BadEntityIdError
 from academy.exception import ForbiddenError
 from academy.exception import MailboxTerminatedError
@@ -17,9 +19,11 @@ from academy.exchange import HttpExchangeFactory
 from academy.exchange import HttpExchangeTransport
 from academy.exchange.cloud.app import StatusCode
 from academy.exchange.cloud.authenticate import NullAuthenticator
+from academy.exchange.cloud.client import _is_retryable_error
 from academy.exchange.cloud.client import _raise_for_status
 from academy.exchange.cloud.client import spawn_http_exchange
 from academy.exchange.cloud.client_info import ClientInfo
+from academy.exchange.transport import MailboxStatus
 from academy.identifier import AgentId
 from academy.identifier import UserId
 from academy.message import Message
@@ -27,6 +31,42 @@ from academy.message import PingRequest
 from academy.socket import open_port
 from testing.constant import TEST_CONNECTION_TIMEOUT
 from testing.constant import TEST_WAIT_TIMEOUT
+
+
+def _make_failing_cm(exc: BaseException) -> mock.MagicMock:
+    cm = mock.MagicMock()
+    cm.__aenter__ = mock.AsyncMock(side_effect=exc)
+    cm.__aexit__ = mock.AsyncMock(return_value=None)
+    return cm
+
+
+def _make_response_cm(
+    status: int = StatusCode.OKAY.value,
+    json_body: dict[str, Any] | None = None,
+    raise_for_status_exc: BaseException | None = None,
+) -> mock.MagicMock:
+    cm = mock.MagicMock()
+    response = mock.MagicMock()
+    response.status = status
+    response.json = mock.AsyncMock(return_value=json_body or {})
+    if raise_for_status_exc is not None:
+        response.raise_for_status = mock.MagicMock(
+            side_effect=raise_for_status_exc,
+        )
+    else:
+        response.raise_for_status = mock.MagicMock(return_value=None)
+    cm.__aenter__ = mock.AsyncMock(return_value=response)
+    cm.__aexit__ = mock.AsyncMock(return_value=None)
+    return cm
+
+
+def _client_response_error(status: int) -> aiohttp.ClientResponseError:
+    return aiohttp.ClientResponseError(
+        request_info=mock.MagicMock(),
+        history=(),
+        status=status,
+        message=f'HTTP {status}',
+    )
 
 
 def test_factory_serialize(
@@ -301,3 +341,352 @@ async def test_listen_receive_event(
             for _ in range(3):
                 received = await anext(listener)
                 assert received == message
+
+
+def test_is_retryable_error_classification() -> None:
+    # Transport-level transient errors are retryable.
+    assert _is_retryable_error(aiohttp.ClientConnectionError())
+    assert _is_retryable_error(aiohttp.ServerDisconnectedError())
+    assert _is_retryable_error(aiohttp.ClientPayloadError())
+    assert _is_retryable_error(asyncio.TimeoutError())
+
+    # 5xx subset is retryable; 500 and 4xx are not.
+    assert _is_retryable_error(_client_response_error(502))
+    assert _is_retryable_error(_client_response_error(503))
+    assert _is_retryable_error(_client_response_error(504))
+    assert not _is_retryable_error(_client_response_error(500))
+    assert not _is_retryable_error(_client_response_error(404))
+
+    # Unrelated exceptions are never retried.
+    assert not _is_retryable_error(ValueError('nope'))
+
+
+def test_factory_validates_retry_params() -> None:
+    with pytest.raises(ValueError, match='max_retries'):
+        HttpExchangeFactory('http://example', max_retries=-1)
+    with pytest.raises(ValueError, match='retry_backoff_base_s'):
+        HttpExchangeFactory('http://example', retry_backoff_base_s=-0.5)
+
+
+def test_factory_propagates_retry_params() -> None:
+    factory = HttpExchangeFactory(
+        'http://example',
+        max_retries=7,
+        retry_backoff_base_s=0.25,
+    )
+    assert factory._info.max_retries == 7  # noqa: PLR2004
+    assert factory._info.retry_backoff_base_s == 0.25  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_console_factory_round_trip_preserves_retry_params(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=5,
+        retry_backoff_base_s=0.125,
+    )
+    console = await factory.console()
+    try:
+        recreated = console.factory()
+        assert recreated._info.max_retries == 5  # noqa: PLR2004
+        assert recreated._info.retry_backoff_base_s == 0.125  # noqa: PLR2004
+    finally:
+        await console.close()
+
+
+def _make_send_message() -> Message[Any]:
+    return Message.create(
+        src=UserId.new(),
+        dest=AgentId.new(),
+        body=PingRequest(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_retries_on_transient_then_succeeds(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=3,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_failing_cm(aiohttp.ServerDisconnectedError()),
+            _make_failing_cm(asyncio.TimeoutError()),
+            _make_response_cm(),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'put',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_put:
+            await transport.send(_make_send_message())
+            assert mock_put.call_count == 3  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_retry_on_terminated_error(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=3,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        terminated = _make_response_cm(status=StatusCode.TERMINATED.value)
+        with mock.patch.object(
+            transport._session,
+            'put',
+            mock.MagicMock(return_value=terminated),
+        ) as mock_put:
+            with pytest.raises(MailboxTerminatedError):
+                await transport.send(_make_send_message())
+            assert mock_put.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_send_exhausts_retries_then_raises(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        always_failing = mock.MagicMock(
+            side_effect=lambda *a, **kw: _make_failing_cm(
+                aiohttp.ClientConnectionError('boom'),
+            ),
+        )
+        with mock.patch.object(transport._session, 'put', always_failing):
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await transport.send(_make_send_message())
+            assert always_failing.call_count == 3  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_send_retries_disabled_with_zero(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=0,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        always_failing = mock.MagicMock(
+            side_effect=lambda *a, **kw: _make_failing_cm(
+                aiohttp.ClientConnectionError('boom'),
+            ),
+        )
+        with mock.patch.object(transport._session, 'put', always_failing):
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await transport.send(_make_send_message())
+            assert always_failing.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_send_retries_on_5xx_response_status(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_response_cm(
+                status=503,
+                raise_for_status_exc=_client_response_error(503),
+            ),
+            _make_response_cm(),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'put',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_put:
+            await transport.send(_make_send_message())
+            assert mock_put.call_count == 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_retry_uses_exponential_backoff(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=3,
+        retry_backoff_base_s=0.5,
+    )
+    async with await factory._create_transport() as transport:
+        always_failing = mock.MagicMock(
+            side_effect=lambda *a, **kw: _make_failing_cm(
+                aiohttp.ClientConnectionError(),
+            ),
+        )
+        with mock.patch.object(transport._session, 'put', always_failing):
+            with mock.patch(
+                'academy.exchange.cloud.client.asyncio.sleep',
+                new=mock.AsyncMock(),
+            ) as mock_sleep:
+                with pytest.raises(aiohttp.ClientConnectionError):
+                    await transport.send(_make_send_message())
+                # base * 2**attempt for attempts 0, 1, 2 → 0.5, 1.0, 2.0
+                assert [c.args[0] for c in mock_sleep.call_args_list] == [
+                    0.5,
+                    1.0,
+                    2.0,
+                ]
+
+
+@pytest.mark.asyncio
+async def test_discover_retries_then_succeeds(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_failing_cm(aiohttp.ClientConnectionError()),
+            _make_response_cm(json_body={'agent_ids': ''}),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'get',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_get:
+            result = await transport.discover('mypkg.Agent')
+            assert result == ()
+            assert mock_get.call_count == 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_register_agent_retries_then_succeeds(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_failing_cm(aiohttp.ClientConnectionError()),
+            _make_response_cm(),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'post',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_post:
+            registration = await transport.register_agent(Agent)
+            assert isinstance(registration.agent_id, AgentId)
+            assert mock_post.call_count == 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_status_retries_then_succeeds(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_failing_cm(aiohttp.ClientConnectionError()),
+            _make_response_cm(
+                json_body={'status': MailboxStatus.ACTIVE.value},
+            ),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'get',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_get:
+            status = await transport.status(UserId.new())
+            assert status == MailboxStatus.ACTIVE
+            assert mock_get.call_count == 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_terminate_retries_then_succeeds(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_failing_cm(aiohttp.ClientConnectionError()),
+            _make_response_cm(),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'delete',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_delete:
+            await transport.terminate(UserId.new())
+            assert mock_delete.call_count == 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_status_retries_then_succeeds(
+    http_exchange_server: tuple[str, int],
+) -> None:
+    host, port = http_exchange_server
+    url = f'http://{host}:{port}'
+    factory = HttpExchangeFactory(
+        url,
+        max_retries=2,
+        retry_backoff_base_s=0,
+    )
+    async with await factory._create_transport() as transport:
+        side_effects = [
+            _make_failing_cm(aiohttp.ClientConnectionError()),
+            _make_response_cm(json_body={'heartbeat': 1234.5}),
+        ]
+        with mock.patch.object(
+            transport._session,
+            'get',
+            mock.MagicMock(side_effect=side_effects),
+        ) as mock_get:
+            heartbeat = await transport.heartbeat_status(UserId.new())
+            assert heartbeat == 1234.5  # noqa: PLR2004
+            assert mock_get.call_count == 2  # noqa: PLR2004
